@@ -13,19 +13,21 @@ import (
 
 // UpgradeRequest asks for a tracked contract's bytecode to be replaced.
 type UpgradeRequest struct {
-	Alias     string `json:"alias"`
-	Network   string `json:"network,omitempty"`
-	Notes     string `json:"notes,omitempty"`
-	DryRun    bool   `json:"dry_run,omitempty"`
-	GitCommit string `json:"git_commit,omitempty"`
-	WasmHash  string `json:"wasm_hash,omitempty"`
+	Alias       string `json:"alias"`
+	Network     string `json:"network,omitempty"`
+	Notes       string `json:"notes,omitempty"`
+	DryRun      bool   `json:"dry_run,omitempty"`
+	GitCommit   string `json:"git_commit,omitempty"`
+	WasmHash    string `json:"wasm_hash,omitempty"`
+	RequireSpec bool   `json:"require_spec,omitempty"`
 }
 
 // UpgradeResult describes a completed or simulated upgrade.
 type UpgradeResult struct {
-	Alias      string `json:"alias"`
-	Network    string `json:"network"`
-	ContractID string `json:"contract_id"`
+	Alias       string `json:"alias"`
+	Network     string `json:"network"`
+	ContractID  string `json:"contract_id"`
+	ContractURL string `json:"contract_url,omitempty"`
 
 	// PreviousWasmHash and WasmHash are the version transition this upgrade
 	// performs. Recording both is what makes the history answer "what changed".
@@ -39,14 +41,24 @@ type UpgradeResult struct {
 
 	UploadTxHash  string `json:"upload_tx_hash,omitempty"`
 	UpgradeTxHash string `json:"upgrade_tx_hash,omitempty"`
+	UploadTxURL   string `json:"upload_tx_url,omitempty"`
+	UpgradeTxURL  string `json:"upgrade_tx_url,omitempty"`
 	Ledger        uint32 `json:"ledger,omitempty"`
 
 	DryRun bool `json:"dry_run"`
+
+	// EstimatedFees is what a dry run estimates each transaction would cost.
+	// Nil unless DryRun is set.
+	EstimatedFees *DryRunFees `json:"estimated_fees,omitempty"`
 
 	UploadEnvelopeXDR  string `json:"upload_envelope_xdr,omitempty"`
 	UpgradeEnvelopeXDR string `json:"upgrade_envelope_xdr,omitempty"`
 
 	UploadSkipped bool `json:"upload_skipped,omitempty"`
+
+	// Warnings lists non-fatal problems found in the local artifact. It is empty
+	// for a clean upgrade, and populated in --json output too.
+	Warnings []string `json:"warnings,omitempty"`
 
 	// NoChange reports that the new bytecode is identical to what is already
 	// live, so no upgrade was performed.
@@ -58,6 +70,11 @@ type UpgradeResult struct {
 	// network's sorovault_url. Absent on a dry run, on a no-change upgrade,
 	// or when no registry is configured.
 	Catalog *CatalogStatus `json:"catalog,omitempty"`
+
+	// Webhooks reports the outcome of delivering notifications to configured
+	// webhook endpoints. Absent on a dry run, on a no-change upgrade, or when
+	// no webhooks are configured.
+	Webhooks []WebhookStatus `json:"webhooks,omitempty"`
 }
 
 func (s *Service) resolveUpgradeHash(ctx context.Context, r resolved, input string) (xdr.Hash, string, error) {
@@ -141,6 +158,7 @@ func (s *Service) Upgrade(ctx context.Context, req UpgradeRequest) (*UpgradeResu
 		wasmHash    xdr.Hash
 		wasmHashHex string
 		wasm        []byte
+		warnings    []string
 	)
 
 	if req.WasmHash != "" {
@@ -163,6 +181,10 @@ func (s *Service) Upgrade(ctx context.Context, req UpgradeRequest) (*UpgradeResu
 		if err != nil {
 			return nil, err
 		}
+		warnings, err = s.checkWasm(wasm, req.RequireSpec)
+		if err != nil {
+			return nil, err
+		}
 		wasmHash = stellar.WasmHash(wasm)
 		wasmHashHex = stellar.HashHex(wasmHash)
 	}
@@ -181,11 +203,13 @@ func (s *Service) Upgrade(ctx context.Context, req UpgradeRequest) (*UpgradeResu
 		Alias:            r.Alias,
 		Network:          r.NetworkName,
 		ContractID:       tracked.ContractID,
+		ContractURL:      r.Network.ContractExplorerURL(tracked.ContractID),
 		PreviousWasmHash: tracked.CurrentWasmHash,
 		WasmHash:         wasmHashHex,
 		Deployer:         signer.Address(),
 		UpgradeFunc:      upgradeFunc,
 		DryRun:           req.DryRun,
+		Warnings:         warnings,
 	}
 
 	// Compare against the ledger rather than the database. If someone upgraded
@@ -203,6 +227,8 @@ func (s *Service) Upgrade(ctx context.Context, req UpgradeRequest) (*UpgradeResu
 		return result, nil
 	}
 
+	fees := &DryRunFees{}
+
 	// Step 1: make the new bytecode available on-chain.
 	if req.WasmHash != "" {
 		result.UploadSkipped = true
@@ -215,7 +241,9 @@ func (s *Service) Upgrade(ctx context.Context, req UpgradeRequest) (*UpgradeResu
 			result.UploadSkipped = true
 		} else {
 			result.UploadTxHash = upload.Hash
+			result.UploadTxURL = r.Network.TransactionExplorerURL(upload.Hash)
 			result.UploadEnvelopeXDR = upload.EnvelopeXDR
+			fees.Upload = &upload.Fee
 		}
 	}
 
@@ -237,15 +265,19 @@ func (s *Service) Upgrade(ctx context.Context, req UpgradeRequest) (*UpgradeResu
 		return nil, err
 	}
 
-	upgrade, err := s.runTransaction(ctx, r, invokeOp, req.DryRun)
+	upgrade, err := s.runTransaction(ctx, r, invokeOp, "upgrade", req.DryRun)
 	if err != nil {
 		return nil, fmt.Errorf("invoke %s on %s: %w", upgradeFunc, tracked.ContractID, err)
 	}
 	result.UpgradeTxHash = upgrade.Hash
+	result.UpgradeTxURL = r.Network.TransactionExplorerURL(upgrade.Hash)
 	result.UpgradeEnvelopeXDR = upgrade.EnvelopeXDR
 	result.Ledger = upgrade.Ledger
+	fees.Upgrade = &upgrade.Fee
+	fees.Total = fees.sum()
 
 	if req.DryRun {
+		result.EstimatedFees = fees
 		log.Info("dry run complete, nothing submitted or recorded")
 		return result, nil
 	}
@@ -277,6 +309,19 @@ func (s *Service) Upgrade(ctx context.Context, req UpgradeRequest) (*UpgradeResu
 	}
 	result.Deployment = deployment
 	result.Catalog = s.publish(ctx, r, tracked.ContractID, log)
+	result.Webhooks = s.notifyWebhooks(ctx, r.Network, WebhookPayload{
+		Alias:          r.Alias,
+		Network:        r.NetworkName,
+		ContractID:     tracked.ContractID,
+		Contract:       tracked.ContractID,
+		WasmHash:       wasmHashHex,
+		Action:         store.ActionUpgrade,
+		DeployerPubkey: signer.Address(),
+		TxHash:         upgrade.Hash,
+		Tx:             upgrade.Hash,
+		Ledger:         upgrade.Ledger,
+		Notes:          req.Notes,
+	}, log)
 
 	return result, nil
 }

@@ -17,6 +17,7 @@ networks:
     rpc_url: https://soroban-testnet.stellar.org
     passphrase: "Test SDF Network ; September 2015"
     sorovault_url: http://localhost:8080
+    explorer_url: https://stellar.expert/explorer/testnet
   mainnet:
     rpc_url: https://mainnet.example.org
     passphrase: "Public Global Stellar Network ; September 2015"
@@ -48,7 +49,13 @@ func TestLoadValidConfig(t *testing.T) {
 	assert.Len(t, cfg.Networks, 2)
 	assert.Len(t, cfg.Contracts, 2)
 	assert.Equal(t, "http://localhost:8080", cfg.Networks["testnet"].SoroVaultURL)
+	assert.Equal(t, "https://stellar.expert/explorer/testnet", cfg.Networks["testnet"].ExplorerURL)
+	assert.Equal(t, "https://stellar.expert/explorer/testnet/contract/C123",
+		cfg.Networks["testnet"].ContractExplorerURL("C123"))
+	assert.Equal(t, "https://stellar.expert/explorer/testnet/tx/ABC",
+		cfg.Networks["testnet"].TransactionExplorerURL("ABC"))
 	assert.Empty(t, cfg.Networks["mainnet"].SoroVaultURL, "the registry is optional per network")
+	assert.Empty(t, cfg.Networks["mainnet"].ContractExplorerURL("C123"))
 }
 
 func TestNetworkLookupFallsBackToDefault(t *testing.T) {
@@ -230,6 +237,20 @@ contracts:
 `,
 			wantErr: "networks.testnet.sorovault_url",
 		},
+		"explorer url without scheme": {
+			config: `
+version: 1
+default_network: testnet
+networks:
+  testnet:
+    rpc_url: https://rpc.example.org
+    passphrase: "Test SDF Network ; September 2015"
+    explorer_url: explorer.example.org
+contracts:
+  counter: {wasm: ./c.wasm}
+`,
+			wantErr: "networks.testnet.explorer_url",
+		},
 		"contract without wasm": {
 			config: `
 version: 1
@@ -359,4 +380,66 @@ func TestValidateAcceptsMissingWasmFile(t *testing.T) {
 
 	_, statErr := os.Stat(cfg.WasmPath(contract))
 	assert.True(t, os.IsNotExist(statErr), "the artifact genuinely does not exist")
+}
+
+func TestWebhooksParseBothForms(t *testing.T) {
+	// A network may list webhooks as bare URLs or as {url, secret} mappings;
+	// both must land in Network.Webhooks.
+	cfg, err := Load(writeConfig(t, `
+version: 1
+default_network: testnet
+networks:
+  testnet:
+    rpc_url: https://rpc.example.org
+    passphrase: "Test SDF Network ; September 2015"
+    webhooks:
+      - https://hooks.example.org/a
+      - url: https://internal.example.org/b
+        secret: shared
+contracts:
+  counter: {wasm: ./c.wasm}
+`))
+	require.NoError(t, err)
+
+	assert.Equal(t, []Webhook{
+		{URL: "https://hooks.example.org/a"},
+		{URL: "https://internal.example.org/b", Secret: "shared"},
+	}, cfg.Networks["testnet"].Webhooks)
+}
+
+func TestWebhookValidation(t *testing.T) {
+	tests := map[string]struct {
+		entries string
+		wantErr string
+	}{
+		"non-http scheme": {
+			entries: "      - ftp://hooks.example.org/a\n",
+			wantErr: "networks.testnet.webhooks[0].url: scheme must be http or https",
+		},
+		"missing host": {
+			entries: "      - \"https://\"\n",
+			wantErr: "networks.testnet.webhooks[0].url: missing host",
+		},
+		"empty url in mapping": {
+			entries: "      - url: https://ok.example.org\n      - {secret: s}\n",
+			wantErr: "networks.testnet.webhooks[1].url: must be set",
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, `
+version: 1
+default_network: testnet
+networks:
+  testnet:
+    rpc_url: https://rpc.example.org
+    passphrase: "Test SDF Network ; September 2015"
+    webhooks:
+`+tc.entries+`contracts:
+  counter: {wasm: ./c.wasm}
+`))
+			assert.ErrorContains(t, err, tc.wantErr)
+		})
+	}
 }

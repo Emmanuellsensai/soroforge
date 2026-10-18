@@ -52,17 +52,27 @@ func printDeployResult(r *deploy.DeployResult) error {
 	}
 
 	fmt.Fprintf(w, "  Contract ID   %s\n", r.ContractID)
+	if r.ContractURL != "" {
+		fmt.Fprintf(w, "  Explorer      %s\n", r.ContractURL)
+	}
 	fmt.Fprintf(w, "  WASM hash     %s\n", r.WasmHash)
 	fmt.Fprintf(w, "  Network       %s\n", r.Network)
 	fmt.Fprintf(w, "  Deployer      %s\n", r.Deployer)
+	printWarnings(w, r.Warnings)
 
 	if r.UploadSkipped {
 		fmt.Fprintf(w, "  Upload        skipped (this bytecode is already on-chain)\n")
 	} else if r.UploadTxHash != "" {
 		fmt.Fprintf(w, "  Upload tx     %s\n", r.UploadTxHash)
+		if r.UploadTxURL != "" {
+			fmt.Fprintf(w, "  Upload URL    %s\n", r.UploadTxURL)
+		}
 	}
 	if r.CreateTxHash != "" {
 		fmt.Fprintf(w, "  Create tx     %s\n", r.CreateTxHash)
+		if r.CreateTxURL != "" {
+			fmt.Fprintf(w, "  Create URL    %s\n", r.CreateTxURL)
+		}
 	}
 	if r.InitTxHash != "" {
 		fmt.Fprintf(w, "  Init tx       %s\n", r.InitTxHash)
@@ -74,8 +84,11 @@ func printDeployResult(r *deploy.DeployResult) error {
 		fmt.Fprintf(w, "  CI run        %s\n", r.Deployment.CIRunURL)
 	}
 	printCatalog(w, r.Catalog)
+	printWebhooks(w, r.Webhooks)
 
 	if r.DryRun {
+		printEstimatedFees(w, r.EstimatedFees)
+
 		fmt.Fprintf(w, "\nAssembled transaction envelopes (unsigned):\n")
 		if r.UploadEnvelopeXDR != "" {
 			fmt.Fprintf(w, "\n  upload:\n  %s\n", r.UploadEnvelopeXDR)
@@ -103,6 +116,9 @@ func printUpgradeResult(r *deploy.UpgradeResult) error {
 		fmt.Fprintf(w, "%s on %s already runs this WASM hash — nothing to do.\n\n",
 			r.Alias, r.Network)
 		fmt.Fprintf(w, "  Contract ID   %s\n", r.ContractID)
+		if r.ContractURL != "" {
+			fmt.Fprintf(w, "  Explorer      %s\n", r.ContractURL)
+		}
 		fmt.Fprintf(w, "  WASM hash     %s\n", r.WasmHash)
 		return nil
 	}
@@ -114,18 +130,28 @@ func printUpgradeResult(r *deploy.UpgradeResult) error {
 	}
 
 	fmt.Fprintf(w, "  Contract ID   %s\n", r.ContractID)
+	if r.ContractURL != "" {
+		fmt.Fprintf(w, "  Explorer      %s\n", r.ContractURL)
+	}
 	fmt.Fprintf(w, "  From          %s\n", r.PreviousWasmHash)
 	fmt.Fprintf(w, "  To            %s\n", r.WasmHash)
 	fmt.Fprintf(w, "  Entrypoint    %s\n", r.UpgradeFunc)
 	fmt.Fprintf(w, "  Deployer      %s\n", r.Deployer)
+	printWarnings(w, r.Warnings)
 
 	if r.UploadSkipped {
 		fmt.Fprintf(w, "  Upload        skipped (this bytecode is already on-chain)\n")
 	} else if r.UploadTxHash != "" {
 		fmt.Fprintf(w, "  Upload tx     %s\n", r.UploadTxHash)
+		if r.UploadTxURL != "" {
+			fmt.Fprintf(w, "  Upload URL    %s\n", r.UploadTxURL)
+		}
 	}
 	if r.UpgradeTxHash != "" {
 		fmt.Fprintf(w, "  Upgrade tx    %s\n", r.UpgradeTxHash)
+		if r.UpgradeTxURL != "" {
+			fmt.Fprintf(w, "  Upgrade URL   %s\n", r.UpgradeTxURL)
+		}
 	}
 	if r.Ledger != 0 {
 		fmt.Fprintf(w, "  Ledger        %d\n", r.Ledger)
@@ -134,13 +160,101 @@ func printUpgradeResult(r *deploy.UpgradeResult) error {
 		fmt.Fprintf(w, "  CI run        %s\n", r.Deployment.CIRunURL)
 	}
 	printCatalog(w, r.Catalog)
+	printWebhooks(w, r.Webhooks)
 
-	if r.DryRun && r.UpgradeEnvelopeXDR != "" {
-		fmt.Fprintf(w, "\nAssembled upgrade envelope (unsigned):\n\n  %s\n", r.UpgradeEnvelopeXDR)
-		fmt.Fprintf(w, "\nRe-run without --dry-run to submit.\n")
+	if r.DryRun {
+		printEstimatedFees(w, r.EstimatedFees)
+
+		if r.UpgradeEnvelopeXDR != "" {
+			fmt.Fprintf(w, "\nAssembled upgrade envelope (unsigned):\n\n  %s\n", r.UpgradeEnvelopeXDR)
+			fmt.Fprintf(w, "\nRe-run without --dry-run to submit.\n")
+		}
 	}
 
 	return nil
+}
+
+// printEstimatedFees renders a dry run's per-transaction and total cost. The
+// figures come from simulation, so they are labelled as estimates rather than
+// promises: the network can charge differently by the time a real deploy runs.
+func printEstimatedFees(w io.Writer, f *deploy.DryRunFees) {
+	if f == nil {
+		return
+	}
+
+	fmt.Fprintf(w, "\nEstimated fees (from simulation; the actual fee may differ):\n")
+	for _, row := range []struct {
+		label string
+		fee   *deploy.FeeEstimate
+	}{
+		{"upload", f.Upload},
+		{"create", f.Create},
+		{"upgrade", f.Upgrade},
+		{"init", f.Init},
+	} {
+		if row.fee == nil {
+			continue
+		}
+		fmt.Fprintf(w, "  %-8s %d stroops (%s XLM)\n", row.label, row.fee.TotalStroops, row.fee.TotalXLM)
+	}
+	fmt.Fprintf(w, "  %-8s %d stroops (%s XLM)\n", "total", f.Total.TotalStroops, f.Total.TotalXLM)
+}
+
+// stderrIsTerminal reports whether stderr is a character device. Only then is
+// in-place progress output safe; pipes, files, and CI logs are not.
+func stderrIsTerminal() bool {
+	info, err := os.Stderr.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
+}
+
+// progressFor returns a progress printer when progress should be shown: always
+// with --progress, and otherwise only when stderr is a terminal. It returns nil
+// when progress is off, which leaves the service silent.
+func progressFor(force bool) deploy.ProgressFunc {
+	interactive := stderrIsTerminal()
+	if !force && !interactive {
+		return nil
+	}
+	return progressPrinter(os.Stderr, interactive)
+}
+
+// progressPrinter renders deploy progress to w. On a terminal each event
+// rewrites a single line; elsewhere each event is its own line, which is what
+// a CI log wants.
+func progressPrinter(w io.Writer, interactive bool) deploy.ProgressFunc {
+	if !interactive {
+		return func(ev deploy.ProgressEvent) {
+			fmt.Fprintln(w, progressLine(ev))
+		}
+	}
+	return func(ev deploy.ProgressEvent) {
+		line := progressLine(ev)
+		if ev.Phase == deploy.ProgressConfirmed {
+			fmt.Fprintf(w, "\r\033[K%s\n", line)
+			return
+		}
+		fmt.Fprintf(w, "\r\033[K%s", line)
+	}
+}
+
+// progressLine renders one event as a single line of text.
+func progressLine(ev deploy.ProgressEvent) string {
+	prefix := fmt.Sprintf("%s on %s: %s", ev.Alias, ev.Network, ev.Step)
+	switch ev.Phase {
+	case deploy.ProgressSimulating:
+		return prefix + ": simulating…"
+	case deploy.ProgressSubmitted:
+		return fmt.Sprintf("%s: submitted (%s)", prefix, shortHash(ev.Hash))
+	case deploy.ProgressWaiting:
+		return fmt.Sprintf("%s: waiting for ledger %d…", prefix, ev.Ledger)
+	case deploy.ProgressConfirmed:
+		return fmt.Sprintf("%s: confirmed in ledger %d", prefix, ev.Ledger)
+	default:
+		return prefix + ": " + ev.Phase
+	}
 }
 
 func printUploadResult(r *deploy.UploadResult) error {
@@ -225,6 +339,15 @@ func printInvokeResult(r *deploy.InvokeResult) error {
 	return nil
 }
 
+// printWarnings reports non-fatal artifact problems found before upload. They
+// go to stdout with the result because they are part of it; --json carries the
+// same text in the result's warnings field.
+func printWarnings(w io.Writer, warnings []string) {
+	for _, warning := range warnings {
+		fmt.Fprintf(w, "  Warning       %s\n", warning)
+	}
+}
+
 // printCatalog reports SoroVault registration. A failure is shown as a
 // warning, not an error: the deploy itself succeeded and is recorded.
 func printCatalog(w io.Writer, c *deploy.CatalogStatus) {
@@ -237,6 +360,16 @@ func printCatalog(w io.Writer, c *deploy.CatalogStatus) {
 		return
 	}
 	fmt.Fprintf(w, "  SoroVault     %s (%d functions)\n", c.Entry.URL, c.Entry.Functions)
+}
+
+func printWebhooks(w io.Writer, webhooks []deploy.WebhookStatus) {
+	for _, wh := range webhooks {
+		if !wh.OK {
+			fmt.Fprintf(w, "  Webhook       failed (%s): %s\n", wh.URL, wh.Error)
+		} else {
+			fmt.Fprintf(w, "  Webhook       delivered to %s\n", wh.URL)
+		}
+	}
 }
 
 func printContracts(contracts []store.Contract) error {
@@ -274,8 +407,19 @@ func printHistory(alias, network string, deployments []store.Deployment) error {
 
 	fmt.Fprintf(out(), "History for %s on %s (newest first):\n\n", alias, network)
 
+	hasExplorerLinks := false
+	for _, d := range deployments {
+		if d.ContractURL != "" || d.TxURL != "" {
+			hasExplorerLinks = true
+			break
+		}
+	}
 	tw := tabwriter.NewWriter(out(), 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "WHEN\tACTION\tWASM HASH\tDEPLOYER\tLEDGER\tFEE (STROOPS)\tFEE (XLM)\tCOMMIT\tTX\tCI RUN\tNOTES")
+	header := "WHEN\tACTION\tWASM HASH\tDEPLOYER\tLEDGER\tFEE (STROOPS)\tFEE (XLM)\tCOMMIT\tTX\tCI RUN"
+	if hasExplorerLinks {
+		header += "\tCONTRACT URL\tTX URL"
+	}
+	fmt.Fprintln(tw, header+"\tNOTES")
 	for _, d := range deployments {
 		feeStroops, feeXLM := "-", "-"
 		if d.FeeCharged != nil {
@@ -307,9 +451,9 @@ func printHistory(alias, network string, deployments []store.Deployment) error {
 				notes = inv
 			}
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+		cols := []string{
 			formatTime(d.CreatedAt),
-			d.Action,
+			string(d.Action),
 			shortHash(d.WasmHash),
 			shortHash(d.DeployerPubkey),
 			formatLedger(d.Ledger),
@@ -318,8 +462,12 @@ func printHistory(alias, network string, deployments []store.Deployment) error {
 			commit,
 			shortHash(d.TxHash),
 			ciRun,
-			truncate(notes, 40),
-		)
+		}
+		if hasExplorerLinks {
+			cols = append(cols, d.ContractURL, d.TxURL)
+		}
+		cols = append(cols, truncate(notes, 40))
+		fmt.Fprintln(tw, strings.Join(cols, "\t"))
 	}
 	return tw.Flush()
 }

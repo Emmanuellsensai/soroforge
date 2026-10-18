@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/soroworks/soroforge/internal/catalog"
 	"github.com/soroworks/soroforge/internal/config"
@@ -52,8 +53,21 @@ type harnessOptions struct {
 	// noSigner builds a read-only service.
 	noSigner bool
 
+	// maxContractSize overrides the Service's WASM size limit.
+	maxContractSize int
+
 	// catalog replaces the SoroVault registrar.
 	catalog catalog.Registrar
+
+	// progress receives deploy progress events, when set.
+	progress deploy.ProgressFunc
+
+	// webhooks replaces the webhook sender.
+	webhooks deploy.WebhookSender
+
+	// logOut captures the service log instead of discarding it, for tests
+	// that assert on what is logged.
+	logOut io.Writer
 }
 
 func newHarness(t *testing.T, opts harnessOptions) *harness {
@@ -104,13 +118,17 @@ contracts:
 	}
 
 	svc, err := deploy.New(deploy.Options{
-		Config:  cfg,
-		Store:   memStore,
-		Signer:  signer,
-		Clients: func(string, config.Network) (stellar.Client, error) { return client, nil },
-		// Discard logs so test output stays readable.
-		Log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Catalog: opts.catalog,
+		Config:          cfg,
+		Store:           memStore,
+		Signer:          signer,
+		Clients:         func(string, config.Network) (stellar.Client, error) { return client, nil },
+		MaxContractSize: opts.maxContractSize,
+		// Discard logs so test output stays readable unless a test asks
+		// to capture them.
+		Log:      slog.New(slog.NewTextHandler(orIoDiscard(opts.logOut), nil)),
+		Catalog:  opts.catalog,
+		Progress: opts.progress,
+		Webhooks: opts.webhooks,
 	})
 	require.NoError(t, err)
 
@@ -123,6 +141,14 @@ contracts:
 		contractID: contractID,
 		wasmHash:   stellar.WasmHash([]byte(wasm)),
 	}
+}
+
+// orIoDiscard keeps the harness log silent unless a test provides a writer.
+func orIoDiscard(w io.Writer) io.Writer {
+	if w != nil {
+		return w
+	}
+	return io.Discard
 }
 
 // simulationReturning builds a simulation response whose return value is the
@@ -216,6 +242,25 @@ func TestDeployRecordsContractAndHistory(t *testing.T) {
 	require.NotNil(t, history[0].FeeCharged)
 	assert.Equal(t, confirmedFee, *history[0].FeeCharged,
 		"history records the confirmed fee, not the simulation estimate")
+}
+
+func TestDeployIncludesExplorerLinks(t *testing.T) {
+	h := newHarness(t, harnessOptions{})
+	network := h.cfg.Networks["testnet"]
+	network.ExplorerURL = "https://stellar.expert/explorer/testnet/"
+	h.cfg.Networks["testnet"] = network
+
+	result, err := h.svc.Deploy(context.Background(), deploy.DeployRequest{Alias: "counter"})
+	require.NoError(t, err)
+	assert.Equal(t, "https://stellar.expert/explorer/testnet/contract/"+h.contractID, result.ContractURL)
+	assert.Equal(t, "https://stellar.expert/explorer/testnet/tx/"+result.UploadTxHash, result.UploadTxURL)
+	assert.Equal(t, "https://stellar.expert/explorer/testnet/tx/"+result.CreateTxHash, result.CreateTxURL)
+
+	history, err := h.svc.History(context.Background(), "testnet", "counter")
+	require.NoError(t, err)
+	require.Len(t, history, 1)
+	assert.Equal(t, result.ContractURL, history[0].ContractURL)
+	assert.Equal(t, result.CreateTxURL, history[0].TxURL)
 }
 
 func TestDeployDryRunSubmitsNothingAndRecordsNothing(t *testing.T) {
@@ -383,6 +428,67 @@ func TestDeployReportsRejectedSubmission(t *testing.T) {
 
 	_, err := h.svc.Deploy(context.Background(), deploy.DeployRequest{Alias: "counter"})
 	assert.ErrorContains(t, err, "rejected by the network")
+}
+
+func TestDeployRetriesTryAgainLaterWithSameEnvelope(t *testing.T) {
+	h := newHarness(t, harnessOptions{})
+	sends := 0
+	h.client.SendFunc = func(_ context.Context, _ string) (stellar.SendResult, error) {
+		sends++
+		if sends <= 2 {
+			return stellar.SendResult{Status: stellar.SendStatusTryAgainLater, Hash: "retry-hash"}, nil
+		}
+		return stellar.SendResult{
+			Status: stellar.SendStatusPending,
+			Hash:   h.client.SendHash,
+		}, nil
+	}
+
+	_, err := h.svc.Deploy(context.Background(), deploy.DeployRequest{Alias: "counter"})
+	require.NoError(t, err)
+	assert.Equal(t, 4, sends, "two retries precede each transaction's accepted send")
+	require.Len(t, h.client.Sent, 4)
+	assert.Equal(t, h.client.Sent[0], h.client.Sent[1])
+	assert.Equal(t, h.client.Sent[1], h.client.Sent[2])
+}
+
+func TestDeployStopsRetryingAfterMaximumAttempts(t *testing.T) {
+	h := newHarness(t, harnessOptions{})
+	h.client.SendFunc = func(context.Context, string) (stellar.SendResult, error) {
+		return stellar.SendResult{
+			Status: stellar.SendStatusTryAgainLater,
+			Hash:   h.client.SendHash,
+		}, nil
+	}
+
+	_, err := h.svc.Deploy(context.Background(), deploy.DeployRequest{Alias: "counter"})
+	require.ErrorContains(t, err, "after 5 attempts")
+	assert.Equal(t, 5, h.client.SendCount())
+}
+
+func TestDeployRetryWaitRespectsConfirmTimeout(t *testing.T) {
+	h := newHarness(t, harnessOptions{})
+	svc, err := deploy.New(deploy.Options{
+		Config:         h.cfg,
+		Store:          h.store,
+		Signer:         h.signer,
+		Clients:        func(string, config.Network) (stellar.Client, error) { return h.client, nil },
+		ConfirmTimeout: 10 * time.Millisecond,
+	})
+	require.NoError(t, err)
+	h.svc = svc
+	h.client.SendFunc = func(context.Context, string) (stellar.SendResult, error) {
+		return stellar.SendResult{
+			Status: stellar.SendStatusTryAgainLater,
+			Hash:   h.client.SendHash,
+		}, nil
+	}
+
+	start := time.Now()
+	_, err = h.svc.Deploy(context.Background(), deploy.DeployRequest{Alias: "counter"})
+	require.ErrorContains(t, err, "submission stopped after 1 attempt")
+	assert.Less(t, time.Since(start), 500*time.Millisecond)
+	assert.Equal(t, 1, h.client.SendCount())
 }
 
 func TestDeployRefusesWhenRestoreIsRequired(t *testing.T) {

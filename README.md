@@ -160,7 +160,8 @@ Set `DATABASE_URL`, and a deployer key via either `SOROFORGE_SECRET_KEY` or
 notes](#security-notes-on-key-handling) first.
 
 **4. Dry run.** This assembles and simulates both transactions, prints the
-contract address a real deploy would produce, and submits and records nothing:
+contract address a real deploy would produce, the estimated fee for each
+transaction and in total (in stroops and XLM), and submits and records nothing:
 
 ```bash
 ./bin/soroforge deploy counter --network testnet --dry-run
@@ -199,6 +200,7 @@ networks:
     rpc_url: https://soroban-testnet.stellar.org
     passphrase: "Test SDF Network ; September 2015"
     sorovault_url: http://localhost:8080   # optional
+    explorer_url: https://stellar.expert/explorer/testnet  # optional
 
 contracts:
   counter:
@@ -213,8 +215,19 @@ inferred from the name — it's mixed into every signature, so a wrong value
 produces a transaction that's invalid on the network you meant to use, and a
 silently defaulted one could sign a mainnet deploy with testnet assumptions.
 
+To see what SoroForge actually resolved — file, environment and flags merged —
+run `soroforge config show`. It needs neither Postgres nor a signing key, prints
+contract WASM paths resolved to absolute paths, and reports secrets only as
+`(set)` or `(unset)`. `--json` emits the same view for scripts.
+
 There is **no public SDF-hosted mainnet RPC**. Point `mainnet` at a provider you
 trust or at your own node.
+
+**`explorer_url`** is an optional block-explorer base URL. SoroForge appends
+`/contract/{contract_id}` and `/tx/{transaction_hash}` for deploy, upgrade, and
+history output. For example, set it to
+`https://stellar.expert/explorer/testnet`. With no explorer URL, output remains
+unchanged.
 
 **`sorovault_url`** registers every confirmed deploy and upgrade with a
 [SoroVault](https://github.com/soroworks/sorovault) registry serving that
@@ -226,12 +239,37 @@ and is best-effort: if SoroVault is down, the deploy still succeeds and is
 recorded, and the output (`catalog` in JSON) says registration failed so you
 can run `sorovault add` later. Dry runs never register anything.
 
+**`webhooks`** notifies endpoints (Slack, Discord, internal services) whenever
+a contract deploy or upgrade is confirmed. Networks can list URLs, or mappings
+with `url` and an optional `secret`:
+
+```yaml
+networks:
+  mainnet:
+    rpc_url: https://mainnet.example.org
+    passphrase: "Public Global Stellar Network ; September 2015"
+    webhooks:
+      - https://hooks.slack.com/services/...
+      - url: https://internal.example.org/deploy-webhook
+        secret: "shared-secret"
+```
+
+Each webhook receives a POST request with a JSON payload (`alias`, `network`,
+`contract_id`, `wasm_hash`, `action`, `deployer_pubkey`, `tx_hash`, `ledger`,
+`notes`). When a `secret` is provided, SoroForge signs the payload with HMAC-SHA256
+in the `X-SoroForge-Signature` header (`sha256=<hex>`). Delivery is best-effort with
+a timeout: a failing webhook never fails the deploy. Dry runs never trigger webhooks.
+
 **Contracts.** `wasm` paths resolve against the config file's directory, not your
 shell's working directory, so `soroforge deploy` behaves the same from anywhere.
 
 **`salt`** makes a contract's address reproducible: addresses derive from
 (deployer address, salt). Leave it unset and each deploy uses a random salt, so
-deploying the same alias twice produces two distinct contracts.
+deploying the same alias twice produces two distinct contracts. With a fixed
+salt the address is known before the upload, so a deploy checks whether a
+contract already exists there and stops with an actionable message — naming the
+address and suggesting `soroforge upgrade` or a different salt — rather than
+paying for an upload and failing later in simulation.
 
 ### Constructor arguments
 
@@ -255,6 +293,8 @@ constructor_args:
 | `void` | omit `value` |
 | `u32` `i32` `u64` `i64` | decimal integer |
 | `u128` `i128` | decimal integer **as a quoted string** |
+| `u256` `i256` | decimal integer **as a quoted string** |
+| `timepoint` `duration` | decimal integer (64-bit unsigned) |
 | `string` `symbol` | text (`symbol` is `[a-zA-Z0-9_]`, max 32 chars) |
 | `bytes` | hex, with or without `0x` |
 | `address` | `G...` account or `C...` contract |
@@ -296,6 +336,9 @@ contracts:
 | `DATABASE_URL` | History database: `postgres://...` or `sqlite:///path/to/file.db`. Required except for `deploy --dry-run`. |
 | `SOROFORGE_SECRET_KEY` | Deployer secret seed (`S...`). |
 | `SOROFORGE_KEYSTORE_PATH` | Path to a file containing only the seed. |
+| `SOROFORGE_SIGNER_COMMAND` | External signing executable, for an HSM or KMS. Mutually exclusive with the seed sources. |
+| `SOROFORGE_SIGNER_PUBLIC_KEY` | The `G...` address `SOROFORGE_SIGNER_COMMAND` signs for. |
+| `SOROFORGE_MAX_CONTRACT_SIZE` | Override the network's contract WASM size limit, in bytes. |
 | `SOROFORGE_API_TOKEN` | Read-write bearer token for `serve`. |
 | `SOROFORGE_API_TOKENS` | Scoped bearer tokens for `serve`, as `name:scope:token` entries — see below. |
 | `SOROFORGE_API_ADDR` | Listen address (default `127.0.0.1:8080`). |
@@ -337,6 +380,8 @@ of an error printed mid-prompt.
 | Command | Description |
 |---|---|
 | `init` | Write a starter `soroforge.yaml` for the contracts built under `target/`. |
+| `config show` | Print the resolved configuration (networks, contracts, environment); secrets stay `(set)`/`(unset)`. |
+| `config check` | Check config and WASM files; `--offline` skips RPC checks. |
 | `deploy <alias>` | Upload WASM, instantiate the contract, record it. |
 | `upgrade <alias>` | Upload new WASM and invoke the contract's upgrade entrypoint. |
 | `upload <alias>` | Install WASM on-chain without deploying or upgrading; prints the hash for a governance proposal. |
@@ -352,14 +397,36 @@ of an error printed mid-prompt.
 | `version` | Print the SoroForge version. |
 
 `deploy`, `upgrade`, and `upload` accept `--dry-run` and `--notes`. Deploy and
-upgrade also accept `--git-commit` to record a source revision supplied by CI
-instead of detecting the current checkout. History displays confirmed
-transaction fees in stroops and XLM, plus the short source commit (`*` marks a
-dirty working tree).
+upgrade also accept `--progress`, `--require-spec`, and `--git-commit`, which
+records a source revision supplied by CI instead of detecting the current
+checkout. History displays confirmed transaction fees in stroops and XLM, plus
+the short source commit (`*` marks a dirty working tree).
+
+**Artifact checks** run before any network call. WASM over the network's
+contract size limit is rejected with its size and the limit, plus a hint to run
+`stellar contract optimize`; if the network raises its limit, set
+`SOROFORGE_MAX_CONTRACT_SIZE`. WASM without a `contractspecv0` section still
+deploys, with a warning that SoroVault cannot catalogue it, client bindings
+cannot be generated, and SoroProbe cannot type its arguments. The warning is in
+`--json` output too; `--require-spec` turns it into an error. A structurally
+malformed WASM is reported before anything is simulated.
+
+`config check` checks that each configured WASM file exists and starts with the
+WebAssembly magic bytes, and that each RPC endpoint reports the configured
+network passphrase. It aggregates failures into one non-zero result. Pass
+`--offline` to skip RPC checks while still validating every artifact.
 
 **`--dry-run`** runs everything up to and including simulation and assembly,
-then stops. It prints the assembled envelopes and the resulting contract
-address, and writes nothing and submits nothing. It's safe to point at mainnet.
+then stops. It prints the assembled envelopes, the resulting contract address,
+and the estimated fee for each transaction and in total — in stroops and XLM,
+from simulation plus the base fee, so the estimate matches what a real
+submission would declare. It writes nothing and submits nothing, and is safe to
+point at mainnet.
+
+**`--progress`** writes a progress line to stderr (`simulating`, `submitted`,
+`waiting for ledger N`, `confirmed`) while a deploy waits for confirmation.
+Progress is shown automatically when stderr is a terminal; the flag forces it on
+in a pipe or CI log. Stdout, including `--json`, is never touched.
 
 **`status` exit codes** make it usable as a CI gate:
 
@@ -451,12 +518,14 @@ unknown token is **401 Unauthorized**.
 | `GET` | `/health` | public | Liveness. Process up; dependencies not checked. |
 | `GET` | `/ready` | public | Readiness. `200` when the database answers and each configured network's RPC returns a latest ledger; `503` with the failing dependency names otherwise. Checks are cached briefly so probes cannot hammer the RPC. |
 | `GET` | `/openapi.json` | public | OpenAPI 3.1 API description. |
-| `POST` | `/v1/deploy` | write | `{"alias","network","notes","dry_run","git_commit"}` → `201` (`200` for a dry run). |
-| `POST` | `/v1/upgrade` | write | Same body → `200`. |
+| `POST` | `/v1/deploy` | write | `{"alias","network","notes","dry_run","git_commit","require_spec"}` → `201` (`200` for a dry run). Add `?async=true` for a job. |
+| `POST` | `/v1/upgrade` | write | Same body → `200`. Add `?async=true` for a job. |
+| `GET` | `/v1/jobs/{id}` | read | Async job state and, when finished, its result. |
 | `GET` | `/v1/contracts?network=&limit=&offset=` | read | Tracked contracts, paginated (default limit 100, maximum 500). |
 | `GET` | `/v1/contracts/{network}/{alias}/history?limit=&offset=` | read | Deployment history, paginated (default limit 100, maximum 500). |
 | `GET` | `/v1/contracts/{network}/{alias}/status` | read | Drift check. |
 | `GET` | `/v1/contracts/{network}/status` | read | Drift check of every tracked contract; `in_sync` is the verdict. |
+| `GET` | `/v1/deployments/{id}` | read | Single deployment record by ID. Returns 404 if not found. |
 
 Every route's scope is declared in one table in
 [`internal/api/api.go`](internal/api/api.go), and a test walks the built router
@@ -487,6 +556,37 @@ name:
 The bearer token value, request bodies, and key material are never logged.
 `/health` is logged at `debug` only, so a liveness probe polling every second
 does not flood the log.
+
+### Async jobs
+
+A deploy waits for two transactions, so `POST /v1/deploy?async=true` (or
+`/v1/upgrade`) returns `202 Accepted` immediately with a job body and a
+`Location` header:
+
+```bash
+curl -X POST 'http://localhost:8080/v1/deploy?async=true' \
+  -H "Authorization: Bearer $SOROFORGE_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"alias":"counter","network":"testnet"}'
+
+# 202 Accepted
+# Location: /v1/jobs/6f1c...
+# {"id":"6f1c...","state":"queued","alias":"counter","network":"testnet","created_at":"..."}
+```
+
+`GET /v1/jobs/{id}` reports one of `queued`, `running`, `succeeded`, or
+`failed`. On success, `result` is the identical body the synchronous endpoint
+returns; on failure, `error` carries the message instead.
+
+Jobs run one at a time **per alias**, across both deploy and upgrade, so two
+operations on one contract cannot race each other. A second job for the same
+alias stays `queued` until the first finishes. Jobs for different aliases run
+concurrently. Synchronous requests are unchanged and are not queued.
+
+Job state is **in memory**: a job survives the request that created it, but not
+a SoroForge restart. Finished jobs are kept for 10 minutes, then `404`. What
+survives a restart is the thing that always did — the deployment history in
+Postgres and the contract on-chain.
 
 ---
 
@@ -537,6 +637,12 @@ manage keys** — that's deliberate, and out of scope.
   CI can override a developer's on-disk key.
 - Passes it straight into a signer, which holds it unexported.
 - Records only the derived public `G...` address.
+- **Or never sees the key at all:** with `SOROFORGE_SIGNER_COMMAND`, SoroForge
+  sends the transaction hash to an external executable and receives a signature,
+  which it verifies against `SOROFORGE_SIGNER_PUBLIC_KEY` before use. The key
+  stays in the HSM or KMS. See [External signers](#external-signers). Configuring
+  a signer command together with a seed or keystore is rejected rather than
+  silently choosing one.
 
 **What it never does:** log the seed at any level, write it to the database,
 include it in `--json` output or API responses, or echo it in an error message —
@@ -566,9 +672,53 @@ route but is refused with `403` on `/v1/deploy` and `/v1/upgrade`, so a leak
 cannot become a mainnet transaction.
 
 **Not implemented, by design:** key generation, multisig or threshold signing,
-hardware wallets, and CI plugin integrations. The `stellar.Signer` interface is
-the extension point for the signing-related ones — see
+and CI plugin integrations. Hardware wallets and KMS-backed keys are supported
+through the external signer command. The `stellar.Signer` interface remains the
+extension point for signing-related work — see
 [`internal/stellar/signer.go`](internal/stellar/signer.go).
+
+### External signers
+
+For keys that must not be exported — an HSM, a cloud KMS, or a remote signing
+service — point `SOROFORGE_SIGNER_COMMAND` at an executable and set
+`SOROFORGE_SIGNER_PUBLIC_KEY` to its `G...` address:
+
+```bash
+export SOROFORGE_SIGNER_COMMAND=/usr/local/bin/my-hsm-signer
+export SOROFORGE_SIGNER_PUBLIC_KEY=GABC...
+```
+
+SoroForge never sees the private key. It runs the command directly (no shell),
+writes one JSON line to stdin, and reads one base64 signature from stdout:
+
+```json
+{"hash":"9f2c...64 lowercase hex characters...","public_key":"GABC..."}
+```
+
+`hash` is the **network-specific transaction hash**, never the envelope — the
+same 32 bytes a Stellar signer signs. `public_key` is the configured address, so
+one command can serve several keys. stdout must be the raw 64-byte Ed25519
+signature, standard or unpadded base64, surrounding whitespace ignored. Anything
+on stderr is captured for error messages only.
+
+SoroForge verifies the returned signature against `SOROFORGE_SIGNER_PUBLIC_KEY`
+and refuses to submit if it does not match, so a command signing with the wrong
+key fails the deploy rather than producing an invalid transaction. A non-zero
+exit, a missing or malformed signature, or an invocation longer than 30 seconds
+is a clear error.
+
+[`examples/signer/main.go`](examples/signer/main.go) is a complete, minimal
+implementation of the protocol. It holds a local test key rather than calling an
+HSM — that is the one part a real signer replaces:
+
+```bash
+go build -o /tmp/soroforge-example-signer ./examples/signer
+SOROFORGE_EXAMPLE_SIGNER_SEED=S... /tmp/soroforge-example-signer
+```
+
+The command is split on whitespace, so quoting is not interpreted; keep
+credentials out of its arguments (they are visible in the process list). If the
+signer needs a token, read it from the command's own environment.
 
 ---
 

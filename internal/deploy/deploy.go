@@ -52,20 +52,27 @@ type DeployRequest struct {
 
 	// GitCommit overrides automatic commit detection, for detached CI checkouts.
 	GitCommit string `json:"git_commit,omitempty"`
+
+	// RequireSpec makes a missing contractspecv0 section an error rather than a
+	// warning.
+	RequireSpec bool `json:"require_spec,omitempty"`
 }
 
 // DeployResult describes a completed or simulated deploy.
 type DeployResult struct {
-	Alias      string `json:"alias"`
-	Network    string `json:"network"`
-	ContractID string `json:"contract_id"`
-	WasmHash   string `json:"wasm_hash"`
-	Deployer   string `json:"deployer_pubkey"`
+	Alias       string `json:"alias"`
+	Network     string `json:"network"`
+	ContractID  string `json:"contract_id"`
+	ContractURL string `json:"contract_url,omitempty"`
+	WasmHash    string `json:"wasm_hash"`
+	Deployer    string `json:"deployer_pubkey"`
 
 	// UploadTxHash and CreateTxHash are the two transactions a deploy performs.
 	// Both are empty on a dry run.
 	UploadTxHash string `json:"upload_tx_hash,omitempty"`
 	CreateTxHash string `json:"create_tx_hash,omitempty"`
+	UploadTxURL  string `json:"upload_tx_url,omitempty"`
+	CreateTxURL  string `json:"create_tx_url,omitempty"`
 
 	// InitTxHash is the transaction hash of the initializer invocation, when
 	// init_fn is configured. Empty on a dry run or when no initializer is used.
@@ -75,6 +82,10 @@ type DeployResult struct {
 
 	// DryRun reports whether anything was actually submitted.
 	DryRun bool `json:"dry_run"`
+
+	// EstimatedFees is what a dry run estimates each transaction would cost.
+	// Nil unless DryRun is set.
+	EstimatedFees *DryRunFees `json:"estimated_fees,omitempty"`
 
 	// UploadEnvelopeXDR and CreateEnvelopeXDR are the assembled transaction
 	// envelopes. On a dry run these are the deliverable: they can be inspected,
@@ -88,12 +99,20 @@ type DeployResult struct {
 	// UploadSkipped reports that the bytecode was already on-chain.
 	UploadSkipped bool `json:"upload_skipped,omitempty"`
 
+	// Warnings lists non-fatal problems found in the local artifact. It is empty
+	// for a clean deploy, and populated in --json output too.
+	Warnings []string `json:"warnings,omitempty"`
+
 	// Deployment is the recorded history entry, absent on a dry run.
 	Deployment *store.Deployment `json:"deployment,omitempty"`
 
 	// Catalog reports registration with the network's sorovault_url. Absent
 	// on a dry run or when no registry is configured.
 	Catalog *CatalogStatus `json:"catalog,omitempty"`
+
+	// Webhooks reports the outcome of delivering notifications to configured
+	// webhook endpoints. Absent on a dry run or when no webhooks are configured.
+	Webhooks []WebhookStatus `json:"webhooks,omitempty"`
 }
 
 // Deploy uploads a contract's bytecode and instantiates it, then records the
@@ -117,6 +136,10 @@ func (s *Service) Deploy(ctx context.Context, req DeployRequest) (*DeployResult,
 	if err != nil {
 		return nil, err
 	}
+	warnings, err := s.checkWasm(wasm, req.RequireSpec)
+	if err != nil {
+		return nil, err
+	}
 	wasmHash := stellar.WasmHash(wasm)
 	wasmHashHex := stellar.HashHex(wasmHash)
 
@@ -134,7 +157,24 @@ func (s *Service) Deploy(ctx context.Context, req DeployRequest) (*DeployResult,
 		WasmHash: wasmHashHex,
 		Deployer: signer.Address(),
 		DryRun:   req.DryRun,
+		Warnings: warnings,
 	}
+
+	salt, err := s.salt(r.Contract)
+	if err != nil {
+		return nil, err
+	}
+
+	// A fixed salt makes the target address deterministic, so a collision can
+	// be caught before the bytecode upload is paid for. A random salt cannot
+	// collide in any way worth checking, so that path skips the lookup.
+	if r.Contract.Salt != "" {
+		if err := s.checkTargetFree(ctx, r, signer.Address(), salt); err != nil {
+			return nil, err
+		}
+	}
+
+	fees := &DryRunFees{}
 
 	// Step 1: upload the bytecode, unless it is already on-chain.
 	upload, skipped, err := s.uploadBytecode(ctx, r, signer, wasm, req.DryRun, log)
@@ -145,7 +185,9 @@ func (s *Service) Deploy(ctx context.Context, req DeployRequest) (*DeployResult,
 		result.UploadSkipped = true
 	} else {
 		result.UploadTxHash = upload.Hash
+		result.UploadTxURL = r.Network.TransactionExplorerURL(upload.Hash)
 		result.UploadEnvelopeXDR = upload.EnvelopeXDR
+		fees.Upload = &upload.Fee
 	}
 
 	// Step 2: instantiate a contract from the uploaded bytecode.
@@ -154,23 +196,21 @@ func (s *Service) Deploy(ctx context.Context, req DeployRequest) (*DeployResult,
 		return nil, fmt.Errorf("constructor args for %s: %w", r.Alias, err)
 	}
 
-	salt, err := s.salt(r.Contract)
-	if err != nil {
-		return nil, err
-	}
-
 	createOp, err := stellar.CreateContractOp(wasmHash, signer.Address(), salt, args, signer.Address())
 	if err != nil {
 		return nil, err
 	}
 
-	create, err := s.runTransaction(ctx, r, createOp, req.DryRun)
+	create, err := s.runTransaction(ctx, r, createOp, "create", req.DryRun)
 	if err != nil {
 		return nil, fmt.Errorf("create contract: %w", err)
 	}
 	result.CreateTxHash = create.Hash
+	result.CreateTxURL = r.Network.TransactionExplorerURL(create.Hash)
 	result.CreateEnvelopeXDR = create.EnvelopeXDR
 	result.Ledger = create.Ledger
+	fees.Create = &create.Fee
+	fees.Total = fees.sum()
 
 	// The contract's address comes from the host function's return value, which
 	// simulation reports — so a dry run knows the address a real deploy would
@@ -180,6 +220,7 @@ func (s *Service) Deploy(ctx context.Context, req DeployRequest) (*DeployResult,
 		return nil, fmt.Errorf("determine contract id: %w", err)
 	}
 	result.ContractID = contractID
+	result.ContractURL = r.Network.ContractExplorerURL(contractID)
 
 	// Step 3: if an initializer function is configured, prepare its invocation.
 	var initOp *txnbuild.InvokeHostFunction
@@ -196,12 +237,15 @@ func (s *Service) Deploy(ctx context.Context, req DeployRequest) (*DeployResult,
 
 	if req.DryRun {
 		if initOp != nil {
-			initTx, err := s.runTransaction(ctx, r, initOp, true)
+			initTx, err := s.runTransaction(ctx, r, initOp, "init", true)
 			if err != nil {
 				return nil, fmt.Errorf("simulate initializer %s: %w", r.Contract.InitFunc, err)
 			}
 			result.InitEnvelopeXDR = initTx.EnvelopeXDR
+			fees.Init = &initTx.Fee
+			fees.Total = fees.sum()
 		}
+		result.EstimatedFees = fees
 		log.Info("dry run complete, nothing submitted or recorded", "contract_id", contractID)
 		return result, nil
 	}
@@ -211,7 +255,7 @@ func (s *Service) Deploy(ctx context.Context, req DeployRequest) (*DeployResult,
 	gitCommit, dirty := gitMetadata(s.cfg.Dir(), req.GitCommit)
 
 	if initOp != nil {
-		initTx, err := s.runTransaction(ctx, r, initOp, false)
+		initTx, err := s.runTransaction(ctx, r, initOp, "init", false)
 		if err != nil {
 			// The contract is already live on-chain, so record it honestly even though initialization failed.
 			failNotes := req.Notes
@@ -262,6 +306,19 @@ func (s *Service) Deploy(ctx context.Context, req DeployRequest) (*DeployResult,
 	}
 	result.Deployment = deployment
 	result.Catalog = s.publish(ctx, r, contractID, log)
+	result.Webhooks = s.notifyWebhooks(ctx, r.Network, WebhookPayload{
+		Alias:          r.Alias,
+		Network:        r.NetworkName,
+		ContractID:     contractID,
+		Contract:       contractID,
+		WasmHash:       wasmHashHex,
+		Action:         store.ActionDeploy,
+		DeployerPubkey: signer.Address(),
+		TxHash:         create.Hash,
+		Tx:             create.Hash,
+		Ledger:         create.Ledger,
+		Notes:          req.Notes,
+	}, log)
 
 	return result, nil
 }
@@ -310,10 +367,64 @@ func (s *Service) readWasm(c config.Contract) ([]byte, error) {
 	return wasm, nil
 }
 
+// checkWasm vets a local artifact before any network work. Both problems it
+// finds are cheap to fix while the file is still on disk, and expensive to
+// discover after a simulation or a live deploy.
+//
+// It returns warnings for non-fatal findings; requireSpec turns the missing
+// interface warning into an error.
+func (s *Service) checkWasm(wasm []byte, requireSpec bool) ([]string, error) {
+	if err := stellar.CheckWasmSize(wasm, s.maxContractSize); err != nil {
+		return nil, err
+	}
+
+	hasSpec, err := stellar.HasContractSpec(wasm)
+	if err != nil {
+		return nil, fmt.Errorf("malformed wasm: %w", err)
+	}
+	if hasSpec {
+		return nil, nil
+	}
+
+	const missing = "wasm has no contractspecv0 section: SoroVault cannot catalogue this contract, " +
+		"client bindings cannot be generated, and SoroProbe cannot type its arguments"
+	if requireSpec {
+		return nil, fmt.Errorf("%s (remove --require-spec to deploy anyway)", missing)
+	}
+	return []string{missing}, nil
+}
+
 // salt returns the contract's configured salt, or a fresh random one.
 func (s *Service) salt(c config.Contract) ([32]byte, error) {
 	if c.Salt != "" {
 		return config.ParseSalt(c.Salt)
 	}
 	return stellar.NewSalt()
+}
+
+// checkTargetFree derives the address a fixed-salt deploy would occupy and
+// fails if a contract instance already lives there.
+//
+// Without this check the collision surfaces as an opaque simulation error for
+// the create transaction — after the upload has already been paid for. Doing it
+// first turns that into a clear, free error that names the address.
+func (s *Service) checkTargetFree(ctx context.Context, r resolved, deployer string, salt [32]byte) error {
+	address, err := stellar.ContractIDFromDeployer(r.Network.Passphrase, deployer, salt)
+	if err != nil {
+		return fmt.Errorf("derive target address for %s: %w", r.Alias, err)
+	}
+
+	occupied, err := stellar.ContractExists(ctx, r.Client, address)
+	if err != nil {
+		return fmt.Errorf("check whether %s is free: %w", address, err)
+	}
+	if occupied {
+		return fmt.Errorf(
+			"address %s for %s on %s is already occupied: use `soroforge upgrade %s` to update "+
+				"the existing contract, or configure a different salt for a new address",
+			address, r.Alias, r.NetworkName, r.Alias)
+	}
+
+	s.log.Debug("target address is free", "contract_id", address)
+	return nil
 }
