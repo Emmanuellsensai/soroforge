@@ -38,6 +38,10 @@ CI runs the same thing in the `e2e` job.
 in so CI needs no Rust toolchain; they differ only in what `version()` returns
 (the `v2` cargo feature), which gives two distinct bytecode hashes.
 
+It is built with `soroban-sdk` 25 on purpose: a contract's protocol version must not
+be newer than the quickstart node's, and an SDK newer than the pinned image
+fails with "contract protocol number is newer than host". Raise both together.
+
 `upgrade` has no authorization check, on purpose: it lets the test upgrade the
 contract outside SoroForge. Do not deploy it anywhere that matters.
 
